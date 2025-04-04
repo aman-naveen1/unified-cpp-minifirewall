@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+rmmod mfw_kmod || true
+rm -f /dev/mfw || true
+
+echo "MiniFirewall removed."
