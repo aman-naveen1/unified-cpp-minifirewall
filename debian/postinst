@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+depmod
+modprobe mfw_kmod
+
+# Create device file if not exists
+if [ ! -e /dev/mfw ]; then
+    major=$(cat /proc/devices | grep mfw | awk '{print $1}')
+    mknod /dev/mfw c "$major" 0
+    chmod 666 /dev/mfw
+fi
+
+echo "MiniFirewall installed and loaded."
