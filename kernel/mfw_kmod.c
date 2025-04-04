@@ -1,137 +1,206 @@
-// kernel/mfw_kmod.c
-
+#include <linux/init.h>
 #include <linux/module.h>
+#include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/cdev.h>
-#include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/device.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
-#include <linux/in6.h>
+#include <linux/skbuff.h>
+#include <linux/netdevice.h>
+#include <linux/proc_fs.h>
+#include <linux/inet.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+
 #include "mfw_kmod.h"
 
-#define DEVICE_NAME "mfw"
+#define MAX_RULES 100
 #define CLASS_NAME "mfw_class"
 
-static dev_t dev_num;
-static struct cdev mfw_cdev;
-static struct class *mfw_class;
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("MiniFirewall Unified");
+MODULE_DESCRIPTION("A Unified MiniFirewall Kernel Module supporting IPv4 and IPv6");
+MODULE_VERSION("2.0");
 
-static LIST_HEAD(rule_list);
-static DEFINE_MUTEX(mfw_mutex);
+static struct mfw_rule rule_list[MAX_RULES];
+static int rule_count = 0;
 
-static ssize_t mfw_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
-{
-    struct mfw_rule *rule;
-    static struct list_head *pos;
-    static bool read_in_progress = false;
+static int major;
+static struct class*  mfw_class  = NULL;
+static struct device* mfw_device = NULL;
 
-    if (!read_in_progress) {
-        pos = rule_list.next;
-        read_in_progress = true;
+/*
+ * Match function for packet filtering
+ */
+static bool match_rule(const struct mfw_rule *r, struct sk_buff *skb, bool is_ipv6) {
+    __u32 s_ip = 0, d_ip = 0;
+    __u16 s_port = 0, d_port = 0;
+    __u8 proto = 0;
+
+    if (is_ipv6)
+        return false; // IPv6 matching not yet implemented in this rule structure
+
+    struct iphdr *iph = ip_hdr(skb);
+    if (!iph)
+        return false;
+
+    proto = iph->protocol;
+    s_ip = ntohl(iph->saddr);
+    d_ip = ntohl(iph->daddr);
+
+    if (proto == IPPROTO_TCP) {
+        struct tcphdr *tcph = tcp_hdr(skb);
+        s_port = ntohs(tcph->source);
+        d_port = ntohs(tcph->dest);
+    } else if (proto == IPPROTO_UDP) {
+        struct udphdr *udph = udp_hdr(skb);
+        s_port = ntohs(udph->source);
+        d_port = ntohs(udph->dest);
     }
 
-    if (pos == &rule_list) {
-        read_in_progress = false;
-        return 0; // EOF
-    }
+    if ((r->proto != 0 && r->proto != proto) ||
+        ((r->s_ip & r->s_mask) != (s_ip & r->s_mask)) ||
+        ((r->d_ip & r->d_mask) != (d_ip & r->d_mask)) ||
+        (r->s_port != 0 && r->s_port != htons(s_port)) ||
+        (r->d_port != 0 && r->d_port != htons(d_port)))
+        return false;
 
-    rule = list_entry(pos, struct mfw_rule, list);
-    if (copy_to_user(buf, rule, sizeof(*rule)))
-        return -EFAULT;
-
-    pos = pos->next;
-    return sizeof(*rule);
+    return true;
 }
 
-static ssize_t mfw_write(struct file *file, const char __user *buf, size_t len, loff_t *offset)
-{
-    struct mfw_ctl ctl;
-    struct mfw_rule *new_rule, *tmp;
+/*
+ * Hook function
+ */
+static unsigned int hook_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
+    int i;
+    bool is_ipv6 = (skb->protocol == htons(ETH_P_IPV6));
 
-    if (len != sizeof(struct mfw_ctl))
-        return -EINVAL;
+    for (i = 0; i < rule_count; ++i) {
+        if ((rule_list[i].in && state->hook == NF_INET_PRE_ROUTING) ||
+            (!rule_list[i].in && state->hook == NF_INET_POST_ROUTING)) {
+            if (match_rule(&rule_list[i], skb, is_ipv6))
+                return NF_DROP;
+        }
+    }
 
-    if (copy_from_user(&ctl, buf, sizeof(struct mfw_ctl)))
+    return NF_ACCEPT;
+}
+
+static struct nf_hook_ops nfho_ipv4 = {
+    .hook     = hook_fn,
+    .pf       = PF_INET,
+    .hooknum  = NF_INET_PRE_ROUTING,
+    .priority = NF_IP_PRI_FIRST
+};
+
+static struct nf_hook_ops nfho_ipv4_out = {
+    .hook     = hook_fn,
+    .pf       = PF_INET,
+    .hooknum  = NF_INET_POST_ROUTING,
+    .priority = NF_IP_PRI_FIRST
+};
+
+/*
+ * Device operations
+ */
+static ssize_t dev_read(struct file *file, char __user *buf, size_t count, loff_t *offset) {
+    if (*offset >= rule_count * sizeof(struct mfw_rule))
+        return 0;
+
+    if (copy_to_user(buf, &rule_list[*offset / sizeof(struct mfw_rule)], sizeof(struct mfw_rule)))
         return -EFAULT;
 
-    mutex_lock(&mfw_mutex);
+    *offset += sizeof(struct mfw_rule);
+    return sizeof(struct mfw_rule);
+}
+
+static ssize_t dev_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
+    struct mfw_ctl ctl;
+
+    if (count != sizeof(struct mfw_ctl))
+        return -EINVAL;
+
+    if (copy_from_user(&ctl, buf, sizeof(ctl)))
+        return -EFAULT;
 
     switch (ctl.mode) {
         case MFW_ADD:
-            new_rule = kmalloc(sizeof(*new_rule), GFP_KERNEL);
-            if (!new_rule) {
-                mutex_unlock(&mfw_mutex);
+            if (rule_count >= MAX_RULES)
                 return -ENOMEM;
-            }
-            memcpy(new_rule, &ctl.rule, sizeof(*new_rule));
-            INIT_LIST_HEAD(&new_rule->list);
-            list_add_tail(&new_rule->list, &rule_list);
+            rule_list[rule_count++] = ctl.rule;
             break;
 
-        case MFW_REMOVE:
-            list_for_each_entry_safe(new_rule, tmp, &rule_list, list) {
-                if (memcmp(&new_rule->in, &ctl.rule.in, sizeof(struct mfw_rule) - sizeof(struct list)) == 0) {
-                    list_del(&new_rule->list);
-                    kfree(new_rule);
+        case MFW_REMOVE: {
+            int i;
+            for (i = 0; i < rule_count; ++i) {
+                if (memcmp(&rule_list[i], &ctl.rule, sizeof(struct mfw_rule)) == 0) {
+                    memmove(&rule_list[i], &rule_list[i+1], (rule_count - i - 1) * sizeof(struct mfw_rule));
+                    rule_count--;
                     break;
                 }
             }
             break;
-
+        }
         default:
-            mutex_unlock(&mfw_mutex);
             return -EINVAL;
     }
 
-    mutex_unlock(&mfw_mutex);
-    return sizeof(struct mfw_ctl);
+    return count;
 }
-
-static int mfw_open(struct inode *inode, struct file *file) { return 0; }
-static int mfw_release(struct inode *inode, struct file *file) { return 0; }
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
-    .open = mfw_open,
-    .release = mfw_release,
-    .read = mfw_read,
-    .write = mfw_write,
+    .read = dev_read,
+    .write = dev_write
 };
 
-static int __init mfw_init(void)
-{
-    alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
-    cdev_init(&mfw_cdev, &fops);
-    cdev_add(&mfw_cdev, dev_num, 1);
+/*
+ * Module init
+ */
+static int __init mfw_init(void) {
+    major = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major < 0) {
+        printk(KERN_ALERT "MiniFirewall failed to register device\n");
+        return major;
+    }
 
     mfw_class = class_create(THIS_MODULE, CLASS_NAME);
-    device_create(mfw_class, NULL, dev_num, NULL, DEVICE_NAME);
+    if (IS_ERR(mfw_class)) {
+        unregister_chrdev(major, DEVICE_NAME);
+        return PTR_ERR(mfw_class);
+    }
 
-    pr_info("MiniFirewall kernel module loaded\n");
+    mfw_device = device_create(mfw_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
+    if (IS_ERR(mfw_device)) {
+        class_destroy(mfw_class);
+        unregister_chrdev(major, DEVICE_NAME);
+        return PTR_ERR(mfw_device);
+    }
+
+    nf_register_net_hook(&init_net, &nfho_ipv4);
+    nf_register_net_hook(&init_net, &nfho_ipv4_out);
+
+    printk(KERN_INFO "MiniFirewall kernel module loaded.\n");
     return 0;
 }
 
-static void __exit mfw_exit(void)
-{
-    struct mfw_rule *rule, *tmp;
-
-    device_destroy(mfw_class, dev_num);
+/*
+ * Module exit
+ */
+static void __exit mfw_exit(void) {
+    nf_unregister_net_hook(&init_net, &nfho_ipv4);
+    nf_unregister_net_hook(&init_net, &nfho_ipv4_out);
+    device_destroy(mfw_class, MKDEV(major, 0));
     class_destroy(mfw_class);
-    cdev_del(&mfw_cdev);
-    unregister_chrdev_region(dev_num, 1);
-
-    list_for_each_entry_safe(rule, tmp, &rule_list, list) {
-        list_del(&rule->list);
-        kfree(rule);
-    }
-
-    pr_info("MiniFirewall kernel module unloaded\n");
+    unregister_chrdev(major, DEVICE_NAME);
+    printk(KERN_INFO "MiniFirewall kernel module unloaded.\n");
 }
 
 module_init(mfw_init);
 module_exit(mfw_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("You");
-MODULE_DESCRIPTION("Unified IPv4 and IPv6 MiniFirewall Kernel Module");
