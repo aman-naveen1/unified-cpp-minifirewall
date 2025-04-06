@@ -126,7 +126,7 @@ sudo rmmod mfw_kmod
 
 ## 🧑‍💻 Author
 
-Made by **Aman Naveen**  
+Made by **Aman Naveen,Mayank Kataria, Vansh Nain**  
 BSc (Hons) Computer Science – Ramanujan College, Delhi University
 
 ---
