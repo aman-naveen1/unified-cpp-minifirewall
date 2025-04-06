@@ -3,6 +3,6 @@ Version: 1.0
 Section: net
 Priority: optional
 Architecture: amd64
-Maintainer: Your Name <you@example.com>
+Maintainer: A-Man <amannaveen69@gmail.com>
 Description: Unified IPv4 and IPv6 MiniFirewall kernel module and CLI tool
  This is a lightweight kernel-space firewall with CLI integration.
